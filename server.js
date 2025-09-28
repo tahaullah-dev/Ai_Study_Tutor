@@ -18,9 +18,13 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Helper function: call AI with fallback models
+// Cache for successful models to avoid retrying failed ones
+let workingModelCache = null;
+let lastModelCacheTime = 0;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+// Helper function: call AI with optimized model selection
 async function callAI(prompt, maxTokens = 1000) {
-  // List of free models to try in order
   const freeModels = [
     "meta-llama/llama-3.2-3b-instruct:free",
     "microsoft/phi-3-mini-128k-instruct:free", 
@@ -29,11 +33,19 @@ async function callAI(prompt, maxTokens = 1000) {
     "openchat/openchat-7b:free"
   ];
 
-  console.log("Sending prompt to AI:", prompt.substring(0, 200) + "...");
+  // Use cached working model if available and recent
+  const now = Date.now();
+  let modelsToTry = freeModels;
   
-  for (let i = 0; i < freeModels.length; i++) {
-    const model = freeModels[i];
-    console.log(`Trying model ${i + 1}/${freeModels.length}: ${model}`);
+  if (workingModelCache && (now - lastModelCacheTime) < CACHE_DURATION) {
+    modelsToTry = [workingModelCache, ...freeModels.filter(m => m !== workingModelCache)];
+  }
+
+  console.log("Sending prompt to AI:", prompt.substring(0, 100) + "...");
+  
+  for (let i = 0; i < modelsToTry.length; i++) {
+    const model = modelsToTry[i];
+    console.log(`Trying model ${i + 1}/${modelsToTry.length}: ${model}`);
     
     try {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -64,7 +76,6 @@ async function callAI(prompt, maxTokens = 1000) {
         console.error(`API Error for ${model}:`, data);
         const errorMessage = data?.error?.message || data?.error || response.statusText || "Unknown API error";
         
-        // If it's not a rate limit, try next model
         if (response.status >= 500 || response.status === 503) {
           console.log(`Server error with ${model}, trying next model...`);
           continue;
@@ -78,18 +89,20 @@ async function callAI(prompt, maxTokens = 1000) {
         continue;
       }
 
-      console.log(`Success with ${model}! Response:`, data.choices[0].message.content.substring(0, 200) + "...");
+      // Cache successful model
+      workingModelCache = model;
+      lastModelCacheTime = now;
+      
+      console.log(`Success with ${model}!`);
       return data.choices[0].message.content;
 
     } catch (err) {
       console.error(`Error with model ${model}:`, err.message);
       
-      // If this is the last model, re-throw the error
-      if (i === freeModels.length - 1) {
+      if (i === modelsToTry.length - 1) {
         throw new Error(`All models failed. Last error: ${err.message}`);
       }
       
-      // Otherwise, continue to next model
       console.log("Trying next model...");
       continue;
     }
@@ -98,12 +111,110 @@ async function callAI(prompt, maxTokens = 1000) {
   throw new Error("All available models are currently unavailable");
 }
 
+// Optimized JSON parsing with better error recovery
+function parseQuizResponse(rawResponse, requestedCount) {
+  let cleaned = rawResponse.trim();
+  
+  // Remove code blocks if present
+  if (cleaned.includes('```')) {
+    cleaned = cleaned.replace(/```json\s*|\s*```/g, '');
+    cleaned = cleaned.trim();
+  }
+  
+  // Find JSON array boundaries
+  const arrayStart = cleaned.indexOf('[');
+  const arrayEnd = cleaned.lastIndexOf(']') + 1;
+  
+  if (arrayStart === -1 || arrayEnd <= arrayStart) {
+    throw new Error("No valid JSON array found in response");
+  }
+  
+  cleaned = cleaned.substring(arrayStart, arrayEnd);
+  
+  try {
+    const quizData = JSON.parse(cleaned);
+    if (!Array.isArray(quizData)) {
+      throw new Error("Response is not an array");
+    }
+    return quizData;
+    
+  } catch (jsonErr) {
+    console.log("Direct JSON parsing failed, attempting recovery...");
+    
+    // Enhanced fallback parsing with regex
+    const questions = [];
+    const questionRegex = /"question"\s*:\s*"([^"\\]*(\\.[^"\\]*)*)"/g;
+    const optionsRegex = /"options"\s*:\s*\[\s*("(?:[^"\\]|\\.)*"(?:\s*,\s*"(?:[^"\\]|\\.)*")*)\s*\]/g;
+    const correctIndexRegex = /"correctIndex"\s*:\s*(\d+)/g;
+    const hintRegex = /"hint"\s*:\s*"([^"\\]*(\\.[^"\\]*)*)"/g;
+    const explanationRegex = /"explanation"\s*:\s*"([^"\\]*(\\.[^"\\]*)*)"/g;
+    
+    let match;
+    const questionTexts = [];
+    const allOptions = [];
+    const correctIndices = [];
+    const hints = [];
+    const explanations = [];
+    
+    // Extract all components
+    while ((match = questionRegex.exec(cleaned)) !== null) {
+      questionTexts.push(match[1]);
+    }
+    
+    while ((match = optionsRegex.exec(cleaned)) !== null) {
+      try {
+        const optionsStr = `[${match[1]}]`;
+        const parsedOptions = JSON.parse(optionsStr);
+        allOptions.push(parsedOptions);
+      } catch (e) {
+        allOptions.push(["Option A", "Option B", "Option C", "Option D"]);
+      }
+    }
+    
+    while ((match = correctIndexRegex.exec(cleaned)) !== null) {
+      correctIndices.push(parseInt(match[1]));
+    }
+    
+    while ((match = hintRegex.exec(cleaned)) !== null) {
+      hints.push(match[1]);
+    }
+    
+    while ((match = explanationRegex.exec(cleaned)) !== null) {
+      explanations.push(match[1]);
+    }
+    
+    // Build questions from extracted data
+    const maxQuestions = Math.min(
+      requestedCount,
+      questionTexts.length, 
+      allOptions.length, 
+      correctIndices.length
+    );
+    
+    for (let i = 0; i < maxQuestions; i++) {
+      questions.push({
+        question: questionTexts[i] || `Sample question ${i + 1}`,
+        options: allOptions[i] || ["Option A", "Option B", "Option C", "Option D"],
+        correctIndex: correctIndices[i] !== undefined ? correctIndices[i] : 0,
+        hint: hints[i] || "Review the material carefully",
+        explanation: explanations[i] || "This is the correct answer based on the content."
+      });
+    }
+    
+    if (questions.length === 0) {
+      throw new Error("Fallback parsing also failed");
+    }
+    
+    return questions;
+  }
+}
+
 // Homepage route
 app.get("/", (req, res) => {
   res.send("AI Study Tutor API is running! Use /api/summarize or /api/generateQuiz.");
 });
 
-// Summarize endpoint
+// Optimized summarize endpoint
 app.post("/api/summarize", async (req, res) => {
   try {
     const { content, length = 'medium' } = req.body;
@@ -116,55 +227,38 @@ app.post("/api/summarize", async (req, res) => {
       return res.status(500).json({ error: "API key not configured" });
     }
 
-    const truncatedContent = content.length > 3000 ? content.substring(0, 3000) + "..." : content;
+    // Aggressive truncation for faster processing
+    const truncatedContent = content.length > 2500 ? content.substring(0, 2500) + "..." : content;
     
     const lengthInstructions = {
-      'short': 'max 100 words',
-      'medium': 'max 200 words', 
-      'long': 'max 300 words'
+      'short': 'max 80 words',
+      'medium': 'max 150 words', 
+      'long': 'max 250 words'
     };
 
+    // Shorter, more direct prompt
     const rawSummary = await callAI(
-      `Provide a concise summary of the following text for a student (${lengthInstructions[length] || 'max 200 words'}). Return ONLY the summary content without any introductory phrases:\n\n${truncatedContent}`,
-      500
+      `Summarize this text (${lengthInstructions[length] || 'max 150 words'}). Use simple language for students:\n\n${truncatedContent}`,
+      Math.min(400, parseInt(lengthInstructions[length]?.match(/\d+/)?.[0] || 150) * 2)
     );
 
-    // Clean up the summary response
-    let summary = rawSummary.trim();
+    // Streamlined cleanup
+    let summary = rawSummary.trim()
+      .replace(/^(Here's|Here is|This is|The following is)\s+(a\s+)?(summary|text|content)[^:]*:\s*/i, '')
+      .replace(/^Summary:\s*/i, '')
+      .trim();
     
-    // Remove common AI intro phrases
-    const introPatterns = [
-      /^Here's a summary of the text in \d+ words or less that a student can understand:\s*/i,
-      /^Here's a summary of the text:\s*/i,
-      /^Here's a concise summary:\s*/i,
-      /^Summary:\s*/i,
-      /^Here is a summary:\s*/i,
-      /^The text can be summarized as follows:\s*/i,
-      /^This text discusses:\s*/i,
-      /^The following is a summary:\s*/i,
-      /^Below is a summary:\s*/i
-    ];
-    
-    for (const pattern of introPatterns) {
-      summary = summary.replace(pattern, '');
-    }
-    
-    // Clean up any remaining formatting issues
-    summary = summary.trim();
-    
-    console.log("Cleaned summary:", summary.substring(0, 100) + "...");
     res.json({ summary });
   } catch (err) {
     console.error("Error generating summary:", err);
-    const errorMessage = err.message || err.toString() || "Unknown error occurred";
     res.status(500).json({ 
       error: "Failed to summarize", 
-      details: errorMessage 
+      details: err.message || "Unknown error occurred" 
     });
   }
 });
 
-// Quiz endpoint
+// Heavily optimized quiz endpoint
 app.post("/api/generateQuiz", async (req, res) => {
   try {
     const { summary, content, count = 5, difficulty = 'medium' } = req.body;
@@ -178,169 +272,82 @@ app.post("/api/generateQuiz", async (req, res) => {
       return res.status(500).json({ error: "API key not configured" });
     }
 
-    const truncatedText = sourceText.length > 2000 ? sourceText.substring(0, 2000) + "..." : sourceText;
+    const requestedCount = Math.min(parseInt(count), 20); // Cap at 20 for performance
     
-    const difficultyInstructions = {
-      'easy': 'Use simple language and basic concepts',
-      'medium': 'Use moderate complexity with some technical terms',
-      'hard': 'Use advanced concepts and technical terminology'
+    // More aggressive truncation for large quiz requests
+    const maxContentLength = requestedCount > 10 ? 1500 : 2000;
+    const truncatedText = sourceText.length > maxContentLength ? 
+      sourceText.substring(0, maxContentLength) + "..." : sourceText;
+    
+    // Simplified difficulty mapping
+    const difficultyMap = {
+      'easy': 'simple concepts',
+      'medium': 'standard difficulty',
+      'hard': 'complex concepts'
     };
 
-    const quiz = await callAI(
-      `Create exactly ${count} multiple-choice questions based on this text. ${difficultyInstructions[difficulty] || ''}. 
-
-CRITICAL: You must return ONLY valid JSON. No explanations, no markdown, no extra text.
-
-Format: Return exactly this JSON structure (with proper quotes and commas):
+    // Optimized prompt - more concise and direct
+    const prompt = `Create ${requestedCount} multiple-choice questions (${difficultyMap[difficulty]}). 
+Return ONLY this JSON format:
 [
   {
-    "question": "Your question here?",
-    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "question": "Question text?",
+    "options": ["A", "B", "C", "D"],
     "correctIndex": 0,
     "hint": "Brief hint",
-    "explanation": "Why this answer is correct"
+    "explanation": "Why correct"
   }
 ]
 
-Rules:
-- Use double quotes only
-- No single quotes anywhere  
-- Ensure all strings are properly quoted
-- Add commas between all array elements
-- No trailing commas
-- correctIndex must be 0, 1, 2, or 3
-- Make sure JSON is valid
+Content:
+${truncatedText}`;
 
-Text for questions:
-${truncatedText}`,
-      Math.max(1200, count * 250) // More tokens for complex JSON
-    );
+    console.log(`Generating ${requestedCount} questions...`);
+    
+    // Dynamic token allocation based on question count
+    const tokensPerQuestion = 120;
+    const baseTokens = 200;
+    const maxTokens = Math.min(4000, baseTokens + (requestedCount * tokensPerQuestion));
+    
+    const quiz = await callAI(prompt, maxTokens);
 
-    console.log("Quiz raw response:", quiz.substring(0, 500) + "...");
+    console.log("Quiz response received, parsing...");
+    
+    let quizData = parseQuizResponse(quiz, requestedCount);
 
-    let cleaned = quiz.trim();
-    
-    // Remove code blocks if present
-    if (cleaned.includes('```')) {
-      cleaned = cleaned.replace(/```json\s*|\s*```/g, '');
-      cleaned = cleaned.trim();
-    }
-    
-    // Remove any explanatory text before the array
-    const arrayStart = cleaned.indexOf('[');
-    const arrayEnd = cleaned.lastIndexOf(']') + 1;
-    
-    if (arrayStart === -1 || arrayEnd <= arrayStart) {
-      console.error("No JSON array found in response:", cleaned);
-      throw new Error("No valid JSON array found in response");
-    }
-    
-    cleaned = cleaned.substring(arrayStart, arrayEnd);
-    console.log("Extracted JSON:", cleaned.substring(0, 300) + "...");
-
-    let quizData = [];
-    try {
-      // Try parsing the JSON as-is first
-      quizData = JSON.parse(cleaned);
-      if (!Array.isArray(quizData)) {
-        throw new Error("Response is not an array");
-      }
-      
-    } catch (jsonErr) {
-      console.error("Direct JSON parsing failed:", jsonErr.message);
-      
-      // Fallback: try to manually extract and build questions
-      try {
-        console.log("Attempting fallback parsing...");
-        
-        // Split by question boundaries and extract each question
-        const questions = [];
-        const questionPattern = /"question"\s*:\s*"([^"]+)"/g;
-        const optionsPattern = /"options"\s*:\s*\[([^\]]+)\]/g;
-        const correctIndexPattern = /"correctIndex"\s*:\s*(\d+)/g;
-        
-        let questionMatch;
-        const questionTexts = [];
-        while ((questionMatch = questionPattern.exec(cleaned)) !== null) {
-          questionTexts.push(questionMatch[1]);
-        }
-        
-        let optionsMatch;
-        const allOptions = [];
-        while ((optionsMatch = optionsPattern.exec(cleaned)) !== null) {
-          try {
-            const optionsStr = `[${optionsMatch[1]}]`;
-            const parsedOptions = JSON.parse(optionsStr);
-            allOptions.push(parsedOptions);
-          } catch (e) {
-            console.log("Failed to parse options:", optionsMatch[1]);
-            allOptions.push(["Option A", "Option B", "Option C", "Option D"]);
-          }
-        }
-        
-        let correctIndexMatch;
-        const correctIndices = [];
-        while ((correctIndexMatch = correctIndexPattern.exec(cleaned)) !== null) {
-          correctIndices.push(parseInt(correctIndexMatch[1]));
-        }
-        
-        // Build questions from extracted data
-        const maxQuestions = Math.min(questionTexts.length, allOptions.length, correctIndices.length);
-        for (let i = 0; i < maxQuestions; i++) {
-          questions.push({
-            question: questionTexts[i],
-            options: allOptions[i],
-            correctIndex: correctIndices[i],
-            hint: "Review the material carefully",
-            explanation: "This is the correct answer based on the content."
-          });
-        }
-        
-        if (questions.length > 0) {
-          quizData = questions;
-          console.log(`Fallback parsing successful: extracted ${questions.length} questions`);
-        } else {
-          throw new Error("Fallback parsing also failed");
-        }
-        
-      } catch (fallbackErr) {
-        console.error("Fallback parsing failed:", fallbackErr.message);
-        throw new Error(`Failed to parse quiz response: ${jsonErr.message}`);
-      }
-    }
-
-    console.log(`Successfully parsed ${quizData.length} questions`);
-    
-    // Validate and filter questions
-    quizData = quizData.filter((q, index) => {
-      const isValid = q.question && 
-                     typeof q.question === 'string' && 
-                     q.question.trim().length > 0 &&
-                     Array.isArray(q.options) && 
-                     q.options.length >= 2 && 
-                     typeof q.correctIndex === 'number' &&
-                     q.correctIndex >= 0 && 
-                     q.correctIndex < q.options.length;
-      
-      if (!isValid) {
-        console.log(`Question ${index + 1} is invalid:`, JSON.stringify(q));
-      }
-      return isValid;
-    }).slice(0, parseInt(count) || 5);
+    // Efficient validation and filtering
+    quizData = quizData
+      .filter(q => {
+        return q.question && 
+               typeof q.question === 'string' && 
+               q.question.trim().length > 5 &&
+               Array.isArray(q.options) && 
+               q.options.length >= 2 && 
+               typeof q.correctIndex === 'number' &&
+               q.correctIndex >= 0 && 
+               q.correctIndex < q.options.length;
+      })
+      .slice(0, requestedCount)
+      .map(q => ({
+        question: q.question.trim(),
+        options: q.options.map(opt => String(opt).trim()),
+        correctIndex: q.correctIndex,
+        hint: q.hint || "Think about the key concepts in the material",
+        explanation: q.explanation || "Review the relevant section for more details"
+      }));
 
     if (quizData.length === 0) {
-      throw new Error("No valid questions were generated. Please try with shorter content or fewer questions.");
+      throw new Error("No valid questions were generated. Try with shorter content.");
     }
 
-    console.log(`Returning ${quizData.length} questions`);
+    console.log(`Successfully generated ${quizData.length} questions`);
     res.json({ questions: quizData });
 
   } catch (err) {
     console.error("Quiz generation error:", err);
-    const errorMessage = err.message || err.toString() || "Unknown error occurred";
     res.status(500).json({ 
       error: "Failed to generate quiz", 
-      details: errorMessage 
+      details: err.message || "Unknown error occurred" 
     });
   }
 });
