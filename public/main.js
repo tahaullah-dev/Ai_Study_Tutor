@@ -1,4 +1,9 @@
 // main.js — fixed and defensive version
+// Detect environment: local vs production
+const API_BASE =
+  window.location.hostname === "localhost"
+    ? "http://localhost:3000" // local backend
+    : "https://ai-study-tutor-awpw.onrender.com"; // your Render backend URL
 
 // safe element lookups (elements may be missing in some builds)
 const contentInput = document.getElementById('contentInput');
@@ -51,7 +56,7 @@ if (summarizeBtn) {
     showQuiz(false);
     showLoading(true);
     try {
-      const resp = await postJSON('/api/summarize', { content, length });
+    const resp = await postJSON(`${API_BASE}/api/summarize`, { content, length });
       let summary = resp.summary || '';
       
       // Clean up any remaining intro phrases on the frontend as well
@@ -121,7 +126,7 @@ if (quizBtn) {
     showQuiz(false);
     showLoading(true);
     try {
-      const quizResp = await postJSON('/api/generateQuiz', {
+      const quizResp = await postJSON(`${API_BASE}/api/generateQuiz`, {
         content: content,
         count: count,
         difficulty: difficulty

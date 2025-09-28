@@ -18,194 +18,70 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Cache for successful models to avoid retrying failed ones
-let workingModelCache = null;
-let lastModelCacheTime = 0;
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+// Only using one known working model
+const WORKING_MODEL = "google/gemma-2-9b-it";
 
-// Helper function: call AI with optimized model selection
+// Helper function: call AI
 async function callAI(prompt, maxTokens = 1000) {
-  const freeModels = [
-    "meta-llama/llama-3.2-3b-instruct:free",
-    "microsoft/phi-3-mini-128k-instruct:free", 
-    "google/gemma-2-9b-it:free",
-    "huggingface/zephyr-7b-beta:free",
-    "openchat/openchat-7b:free"
-  ];
-
-  // Use cached working model if available and recent
-  const now = Date.now();
-  let modelsToTry = freeModels;
-  
-  if (workingModelCache && (now - lastModelCacheTime) < CACHE_DURATION) {
-    modelsToTry = [workingModelCache, ...freeModels.filter(m => m !== workingModelCache)];
+  if (!process.env.OPENROUTER_API_KEY) {
+    throw new Error("API key not configured");
   }
 
   console.log("Sending prompt to AI:", prompt.substring(0, 100) + "...");
-  
-  for (let i = 0; i < modelsToTry.length; i++) {
-    const model = modelsToTry[i];
-    console.log(`Trying model ${i + 1}/${modelsToTry.length}: ${model}`);
-    
-    try {
-      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: model,
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: maxTokens,
-          temperature: 0.7,
-          top_p: 0.9,
-          stream: false
-        }),
-      });
 
-      const data = await response.json();
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: WORKING_MODEL,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+      temperature: 0.7,
+      top_p: 0.9,
+      stream: false,
+    }),
+  });
 
-      // If rate limited (429), try next model
-      if (response.status === 429) {
-        console.log(`Model ${model} is rate limited, trying next model...`);
-        continue;
-      }
+  const data = await response.json();
 
-      if (!response.ok) {
-        console.error(`API Error for ${model}:`, data);
-        const errorMessage = data?.error?.message || data?.error || response.statusText || "Unknown API error";
-        
-        if (response.status >= 500 || response.status === 503) {
-          console.log(`Server error with ${model}, trying next model...`);
-          continue;
-        }
-        
-        throw new Error(`API Error (${response.status}): ${errorMessage}`);
-      }
-
-      if (!data.choices || !data.choices[0]?.message?.content) {
-        console.error(`Unexpected response from ${model}:`, data);
-        continue;
-      }
-
-      // Cache successful model
-      workingModelCache = model;
-      lastModelCacheTime = now;
-      
-      console.log(`Success with ${model}!`);
-      return data.choices[0].message.content;
-
-    } catch (err) {
-      console.error(`Error with model ${model}:`, err.message);
-      
-      if (i === modelsToTry.length - 1) {
-        throw new Error(`All models failed. Last error: ${err.message}`);
-      }
-      
-      console.log("Trying next model...");
-      continue;
-    }
+  if (!response.ok) {
+    const errMsg = data?.error?.message || data?.error || response.statusText || "Unknown API error";
+    throw new Error(`API Error (${response.status}): ${errMsg}`);
   }
-  
-  throw new Error("All available models are currently unavailable");
+
+  if (!data.choices || !data.choices[0]?.message?.content) {
+    throw new Error("No response from AI");
+  }
+
+  return data.choices[0].message.content;
 }
 
-// Optimized JSON parsing with better error recovery
+// Parse quiz JSON safely
 function parseQuizResponse(rawResponse, requestedCount) {
   let cleaned = rawResponse.trim();
-  
-  // Remove code blocks if present
+
   if (cleaned.includes('```')) {
-    cleaned = cleaned.replace(/```json\s*|\s*```/g, '');
-    cleaned = cleaned.trim();
+    cleaned = cleaned.replace(/```json\s*|\s*```/g, '').trim();
   }
-  
-  // Find JSON array boundaries
+
   const arrayStart = cleaned.indexOf('[');
   const arrayEnd = cleaned.lastIndexOf(']') + 1;
-  
+
   if (arrayStart === -1 || arrayEnd <= arrayStart) {
     throw new Error("No valid JSON array found in response");
   }
-  
+
   cleaned = cleaned.substring(arrayStart, arrayEnd);
-  
+
   try {
     const quizData = JSON.parse(cleaned);
-    if (!Array.isArray(quizData)) {
-      throw new Error("Response is not an array");
-    }
+    if (!Array.isArray(quizData)) throw new Error("Response is not an array");
     return quizData;
-    
   } catch (jsonErr) {
-    console.log("Direct JSON parsing failed, attempting recovery...");
-    
-    // Enhanced fallback parsing with regex
-    const questions = [];
-    const questionRegex = /"question"\s*:\s*"([^"\\]*(\\.[^"\\]*)*)"/g;
-    const optionsRegex = /"options"\s*:\s*\[\s*("(?:[^"\\]|\\.)*"(?:\s*,\s*"(?:[^"\\]|\\.)*")*)\s*\]/g;
-    const correctIndexRegex = /"correctIndex"\s*:\s*(\d+)/g;
-    const hintRegex = /"hint"\s*:\s*"([^"\\]*(\\.[^"\\]*)*)"/g;
-    const explanationRegex = /"explanation"\s*:\s*"([^"\\]*(\\.[^"\\]*)*)"/g;
-    
-    let match;
-    const questionTexts = [];
-    const allOptions = [];
-    const correctIndices = [];
-    const hints = [];
-    const explanations = [];
-    
-    // Extract all components
-    while ((match = questionRegex.exec(cleaned)) !== null) {
-      questionTexts.push(match[1]);
-    }
-    
-    while ((match = optionsRegex.exec(cleaned)) !== null) {
-      try {
-        const optionsStr = `[${match[1]}]`;
-        const parsedOptions = JSON.parse(optionsStr);
-        allOptions.push(parsedOptions);
-      } catch (e) {
-        allOptions.push(["Option A", "Option B", "Option C", "Option D"]);
-      }
-    }
-    
-    while ((match = correctIndexRegex.exec(cleaned)) !== null) {
-      correctIndices.push(parseInt(match[1]));
-    }
-    
-    while ((match = hintRegex.exec(cleaned)) !== null) {
-      hints.push(match[1]);
-    }
-    
-    while ((match = explanationRegex.exec(cleaned)) !== null) {
-      explanations.push(match[1]);
-    }
-    
-    // Build questions from extracted data
-    const maxQuestions = Math.min(
-      requestedCount,
-      questionTexts.length, 
-      allOptions.length, 
-      correctIndices.length
-    );
-    
-    for (let i = 0; i < maxQuestions; i++) {
-      questions.push({
-        question: questionTexts[i] || `Sample question ${i + 1}`,
-        options: allOptions[i] || ["Option A", "Option B", "Option C", "Option D"],
-        correctIndex: correctIndices[i] !== undefined ? correctIndices[i] : 0,
-        hint: hints[i] || "Review the material carefully",
-        explanation: explanations[i] || "This is the correct answer based on the content."
-      });
-    }
-    
-    if (questions.length === 0) {
-      throw new Error("Fallback parsing also failed");
-    }
-    
-    return questions;
+    throw new Error("Failed to parse quiz JSON: " + jsonErr.message);
   }
 }
 
@@ -214,79 +90,55 @@ app.get("/", (req, res) => {
   res.send("AI Study Tutor API is running! Use /api/summarize or /api/generateQuiz.");
 });
 
-// Optimized summarize endpoint
+// Summarize endpoint
 app.post("/api/summarize", async (req, res) => {
   try {
     const { content, length = 'medium' } = req.body;
-    
-    if (!content) {
-      return res.status(400).json({ error: "No content provided" });
-    }
 
-    if (!process.env.OPENROUTER_API_KEY) {
-      return res.status(500).json({ error: "API key not configured" });
-    }
+    if (!content) return res.status(400).json({ error: "No content provided" });
 
-    // Aggressive truncation for faster processing
     const truncatedContent = content.length > 2500 ? content.substring(0, 2500) + "..." : content;
-    
+
     const lengthInstructions = {
       'short': 'max 80 words',
-      'medium': 'max 150 words', 
+      'medium': 'max 150 words',
       'long': 'max 250 words'
     };
 
-    // Shorter, more direct prompt
     const rawSummary = await callAI(
       `Summarize this text (${lengthInstructions[length] || 'max 150 words'}). Use simple language for students:\n\n${truncatedContent}`,
       Math.min(400, parseInt(lengthInstructions[length]?.match(/\d+/)?.[0] || 150) * 2)
     );
 
-    // Streamlined cleanup
-    let summary = rawSummary.trim()
+    const summary = rawSummary.trim()
       .replace(/^(Here's|Here is|This is|The following is)\s+(a\s+)?(summary|text|content)[^:]*:\s*/i, '')
       .replace(/^Summary:\s*/i, '')
       .trim();
-    
+
     res.json({ summary });
   } catch (err) {
     console.error("Error generating summary:", err);
-    res.status(500).json({ 
-      error: "Failed to summarize", 
-      details: err.message || "Unknown error occurred" 
-    });
+    res.status(500).json({ error: "Failed to summarize", details: err.message });
   }
 });
 
-// Heavily optimized quiz endpoint
+// Quiz endpoint
 app.post("/api/generateQuiz", async (req, res) => {
   try {
     const { summary, content, count = 5, difficulty = 'medium' } = req.body;
     const sourceText = content || summary;
-    
-    if (!sourceText) {
-      return res.status(400).json({ error: "No content or summary provided" });
-    }
 
-    if (!process.env.OPENROUTER_API_KEY) {
-      return res.status(500).json({ error: "API key not configured" });
-    }
+    if (!sourceText) return res.status(400).json({ error: "No content or summary provided" });
 
-    const requestedCount = Math.min(parseInt(count), 20); // Cap at 20 for performance
-    
-    // More aggressive truncation for large quiz requests
-    const maxContentLength = requestedCount > 10 ? 1500 : 2000;
-    const truncatedText = sourceText.length > maxContentLength ? 
-      sourceText.substring(0, maxContentLength) + "..." : sourceText;
-    
-    // Simplified difficulty mapping
+    const requestedCount = Math.min(parseInt(count), 20);
+    const truncatedText = sourceText.length > 2000 ? sourceText.substring(0, 2000) + "..." : sourceText;
+
     const difficultyMap = {
       'easy': 'simple concepts',
       'medium': 'standard difficulty',
       'hard': 'complex concepts'
     };
 
-    // Optimized prompt - more concise and direct
     const prompt = `Create ${requestedCount} multiple-choice questions (${difficultyMap[difficulty]}). 
 Return ONLY this JSON format:
 [
@@ -302,70 +154,42 @@ Return ONLY this JSON format:
 Content:
 ${truncatedText}`;
 
-    console.log(`Generating ${requestedCount} questions...`);
-    
-    // Dynamic token allocation based on question count
     const tokensPerQuestion = 120;
     const baseTokens = 200;
     const maxTokens = Math.min(4000, baseTokens + (requestedCount * tokensPerQuestion));
-    
+
     const quiz = await callAI(prompt, maxTokens);
+    const quizData = parseQuizResponse(quiz, requestedCount);
 
-    console.log("Quiz response received, parsing...");
-    
-    let quizData = parseQuizResponse(quiz, requestedCount);
-
-    // Efficient validation and filtering
-    quizData = quizData
-      .filter(q => {
-        return q.question && 
-               typeof q.question === 'string' && 
-               q.question.trim().length > 5 &&
-               Array.isArray(q.options) && 
-               q.options.length >= 2 && 
-               typeof q.correctIndex === 'number' &&
-               q.correctIndex >= 0 && 
-               q.correctIndex < q.options.length;
-      })
+    const filtered = quizData
+      .filter(q => q.question && Array.isArray(q.options) && q.options.length >= 2 && typeof q.correctIndex === 'number')
       .slice(0, requestedCount)
       .map(q => ({
         question: q.question.trim(),
         options: q.options.map(opt => String(opt).trim()),
         correctIndex: q.correctIndex,
-        hint: q.hint || "Think about the key concepts in the material",
-        explanation: q.explanation || "Review the relevant section for more details"
+        hint: q.hint || "Think about the key concepts",
+        explanation: q.explanation || "Review the material"
       }));
 
-    if (quizData.length === 0) {
-      throw new Error("No valid questions were generated. Try with shorter content.");
-    }
+    if (filtered.length === 0) throw new Error("No valid questions generated");
 
-    console.log(`Successfully generated ${quizData.length} questions`);
-    res.json({ questions: quizData });
+    res.json({ questions: filtered });
 
   } catch (err) {
     console.error("Quiz generation error:", err);
-    res.status(500).json({ 
-      error: "Failed to generate quiz", 
-      details: err.message || "Unknown error occurred" 
-    });
+    res.status(500).json({ error: "Failed to generate quiz", details: err.message });
   }
 });
 
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
-  res.status(500).json({ 
-    error: 'Internal server error', 
-    details: err.message || 'Unknown error' 
-  });
+  res.status(500).json({ error: 'Internal server error', details: err.message });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ AI Study Tutor running on port ${PORT}`);
-  console.log("Environment check:", {
-    hasApiKey: !!process.env.OPENROUTER_API_KEY,
-    nodeVersion: process.version
-  });
+  console.log("Environment check:", { hasApiKey: !!process.env.OPENROUTER_API_KEY });
 });
