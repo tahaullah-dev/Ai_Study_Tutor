@@ -1,4 +1,4 @@
-// main.js — fixed and defensive version
+// main.js – fixed and defensive version
 // Detect environment: local vs production
 const API_BASE =
   window.location.hostname === "localhost"
@@ -182,7 +182,7 @@ function renderQuiz(questions) {
     const hintBtn = document.createElement('button');
     hintBtn.className = 'neumo-btn small';
     hintBtn.style.marginTop = '8px';
-    hintBtn.textContent = 'Show Hint';
+    hintBtn.textContent = '💡 Show Hint';
     const hintBox = document.createElement('div');
     hintBox.className = 'hint hidden';
     hintBox.textContent = q.hint || 'No hint available.';
@@ -196,7 +196,7 @@ function renderQuiz(questions) {
 
   const submitBtn = document.createElement('button');
   submitBtn.className = 'neumo-btn';
-  submitBtn.textContent = 'Submit Answers';
+  submitBtn.textContent = '✅ Submit Answers';
   submitBtn.style.marginTop = '12px';
   submitBtn.addEventListener('click', () => submitAnswers(questions, state));
   quizContainer.appendChild(submitBtn);
@@ -235,7 +235,7 @@ function submitAnswers(questions, state) {
   state.correct = correctCount;
   if (quizResult) {
     quizResult.classList.remove('hidden');
-    quizResult.innerHTML = `<strong>Score:</strong> ${correctCount} / ${questions.length}`;
+    quizResult.innerHTML = `<strong>🎯 Score:</strong> ${correctCount} / ${questions.length}`;
   }
   if (retryQuiz) {
     retryQuiz.classList.remove('hidden');
@@ -248,7 +248,7 @@ function escapeHtml(str) {
 }
 
 /* -------------------------
-   File input (guarded) — optional in HTML
+   File input (guarded) – optional in HTML
    ------------------------- */
 if (fileInput) {
   fileInput.addEventListener('change', async (ev) => {
@@ -274,10 +274,24 @@ document.addEventListener('DOMContentLoaded', () => {
   const saved = localStorage.getItem('theme');
   if (saved === 'dark') document.body.classList.add('dark');
 
+  // Function to check if screen is mobile sized
+  const isMobile = () => window.innerWidth <= 768;
+
   const setBtnText = () => {
-    themeToggle.textContent = document.body.classList.contains('dark') ? '☀️ Light Mode' : '🌙 Dark Mode';
+    const isDark = document.body.classList.contains('dark');
+    if (isMobile()) {
+      // Use only icons on mobile for compact size
+      themeToggle.textContent = isDark ? '☀️' : '🌙';
+    } else {
+      // Use full text on desktop
+      themeToggle.textContent = isDark ? '☀️ Light Mode' : '🌙 Dark Mode';
+    }
   };
+  
   setBtnText();
+
+  // Update button text when window is resized
+  window.addEventListener('resize', setBtnText);
 
   themeToggle.addEventListener('click', () => {
     document.body.classList.toggle('dark');
