@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>AI Study Tutor</title>
+  <link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+  <button id="themeToggle" class="neumo-btn" style="position: absolute; top: 20px; right: 20px;">🌙 Dark Mode</button>
+  <div class="container">
+    <h1>📘 AI Study Tutor</h1>
+
+    <label for="summaryLength"><strong>Summary Length:</strong></label>
+    <select id="summaryLength">
+      <option value="short">Short</option>
+      <option value="medium" selected>Medium</option>
+      <option value="long">Long</option>
+    </select>
+
+    <label for="quizDifficulty" style="margin-left:20px;"><strong>Quiz Difficulty:</strong></label>
+    <select id="quizDifficulty">
+      <option value="easy">Easy</option>
+      <option value="medium" selected>Medium</option>
+      <option value="hard">Hard</option>
+    </select>
+
+    <label for="questionCount" style="margin-left:20px;"><strong>Number of Questions:</strong></label>
+    <select id="questionCount">
+      <option value="3">3</option>
+      <option value="5" selected>5</option>
+      <option value="10">10</option>
+      <option value="15">15</option>
+    </select>
+
+    <textarea id="contentInput" placeholder="Paste your study material here..."></textarea>
+
+    <div class="buttons">
+      <button id="summarizeBtn">Summarize</button>
+      <button id="quizBtn">Generate Quiz</button>
+    </div>
+
+    <div id="loading" class="hidden">⏳ Processing...</div>
+
+    <div id="summarySection" class="card hidden">
+      <div id="summaryDisplay"></div>
+      <button id="regenerateSummary" class="neumo-btn small">Regenerate</button>
+      <button id="copySummary" class="neumo-btn small">Copy</button>
+    </div>
+    <div id="quizSection" class="card hidden">
+      <div id="quizContainer"></div>
+      <div id="quizResult" class="hidden"></div>
+      <button id="retryQuiz" class="neumo-btn small hidden">Retry Quiz</button>
+    </div>
+  </div>
+  <script src="main.js"></script>
+</body>
+</html>
